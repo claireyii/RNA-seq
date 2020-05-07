@@ -1,0 +1,147 @@
+---
+title: "se_paul"
+author: "Claire Man"
+date: "3/23/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+load("../data/se_paul.rda")
+```
+  
+```{r}
+library(SingleCellExperiment)
+```
+
+```{r}
+sim <- SingleCellExperiment(se)
+counts <- counts(assay(sim))
+sim <- SingleCellExperiment(assays = List(counts = counts))
+```
+
+## Gene Filtering (unnecessary)
+geneFilter <- apply(counts,1,function(x){
+    sum(x >= 3) >= 10
+})
+sim <- sim[geneFilter, ]
+
+
+## Normalization
+```{r}
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sim)$norm <- FQnorm(assays(sim)$counts)
+```
+
+## Dimensionality Reduction
+### PCA
+```{r}
+pca <- prcomp(t(log1p(assays(sim)$norm)), scale. = FALSE)
+rd1 <- pca$x[,1:2]
+```
+
+```{r}
+plot(rd1, col = rgb(0,0,0,.5), pch=16, asp = 1)
+```
+
+```{r}
+reducedDims(sim) <- SimpleList(PCA = rd1)
+```
+
+  
+### UMAP
+```{r}
+library(umap)
+```
+
+```{r}
+# sce <- runUMAP(sce, dimred="PCA")
+```
+  
+## Clustering Cells
+```{r}
+library(mclust, quietly = TRUE)
+```
+
+```{r}
+cl1 <- Mclust(rd1)$classification
+colData(sim)$GMM <- cl1
+
+library(RColorBrewer)
+plot(rd1, col = brewer.pal(9,"Set1")[cl1], pch=16, asp = 1)
+```
+
+## Fit Slingshot  
+```{r}
+library(slingshot)
+```
+
+```{r}
+sim <- slingshot(sim, clusterLabels = 'GMM', reducedDim = "PCA")
+```
+
+```{r}
+summary(sim$slingPseudotime_1)
+
+colors <- colorRampPalette(brewer.pal(11,'Spectral')[-6])(100)
+plotcol <- colors[cut(sim$slingPseudotime_1, breaks=100)]
+
+plot(reducedDims(sim)$PCA, col = plotcol, pch=16, asp = 1)
+lines(SlingshotDataSet(sim), lwd=2, col='black')
+```
+  
+## Extract Curves
+```{r}
+SlingshotDataSet(sim)
+# slingCurves(sim)$curve1
+```
+
+```{r}
+head(slingPseudotime(sim))
+```
+
+## Trade Seq
+```{r}
+library(tradeSeq)
+```
+
+```{r}
+cl <- kmeans(rd1, centers = 7)$cluster
+lin <- getLineages(rd1, clusterLabels = cl, start.clus = 1)
+crv <- getCurves(lin)
+```
+
+```{r}
+library(BiocParallel)
+library(magrittr)
+```
+
+```{r}
+counts_mat <- as.matrix(counts)
+sce <- fitGAM(counts = counts_mat,
+                  sds = crv)
+```
+  
+```{r}
+plotGeneCount(curve = crv, counts = counts, clusters = cl,
+              models = sce)
+```
+
+```{r}
+startRes <- startVsEndTest(sce)
+oStart <- order(startRes$waldStat, decreasing = TRUE)
+sigGeneStart <- names(sce)[oStart[1]]
+plotSmoothers(sce, counts, gene = sigGeneStart)
+```
+
+

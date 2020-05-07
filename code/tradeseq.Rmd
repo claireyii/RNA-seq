@@ -1,0 +1,276 @@
+---
+title: "Tradeseq"
+author: "Claire Man"
+date: "3/18/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+- For every gene in the datast, tradeSeq fits a generalized additive model (GAM) by building on the mgcv R package.  
+- It then allows statistical inference on the GAM by assessing contrasts of the parameters of the fitted GAM model, ading in interpreting complex datasets.  
+  
+  
+# Load Data  
+```{r}
+library(tradeSeq)
+library(RColorBrewer)
+library(SingleCellExperiment)
+library(slingshot)
+
+# For reproducibility
+RNGversion("3.5.0")
+palette(brewer.pal(8, "Dark2"))
+data(countMatrix, package = "tradeSeq")
+counts <- countMatrix
+rm(countMatrix)
+data(crv, package = "tradeSeq")
+data(celltype, package = "tradeSeq")
+```
+  
+  
+# Fit trajectories using slingshot   
+- use the reduced space calculated with the UMAP method.  
+- cluster the data using k-menas with 7 clusters.
+  
+```{r}
+set.seed(200)
+rd <- reducedDims(crv)
+cl <- kmeans(rd, centers = 7)$cluster
+plot(rd, col = brewer.pal(9, "Set1")[cl], pch = 16, asp = 1,
+     cex = 2/3)
+```
+  
+- get the trajectory
+```{r}
+lin <- getLineages(rd, clusterLabels = cl, start.clus = 1)
+crv <- getCurves(lin)
+plotGeneCount(curve = crv, clusters = cl)
+
+# colored by cell type
+plotGeneCount(curve = crv, clusters = celltype, 
+              title = "Colored by cell type")
+```
+  
+  
+# Determining the number of knots (?)
+- The core function from tradeSeq, fitGAM, will use cubic splines as basis functions, and it tries to ensure that every lineage will end at a knot point of a smoother.  
+- The number of knots should be selected to reach an optimal bias-variance trade-off for the smoother (AIC).   
+```{r}
+library(Matrix)
+icMat <- evaluateK(counts = counts, sds = crv, k=3:20, nGenes = 200,
+                   verbose=FALSE)
+# alternatively:
+icMat <- evaluateK(counts = counts, k=3:20, nGenes = 200,
+                   pseudotime = slingPseudotime(crv, na = FALSE),
+                   cellWeights = slingCurveWeights(crv))
+```
+  
+  
+# Fit Additive models  
+- By default, the GAM model estimates one smoother for every lineage using the negative binomial distribution.   
+- tradeSeq allows input from any trajectory inference method with the pseudotime and cellWeights arguments.
+- Because cells are assigned to a lineage based on their weigths, the result of fitGAM is stochastic. 
+
+```{r}
+library(BiocParallel)
+library(magrittr)
+# Register BiocParallel Serial Execution (no parallelization in that case)
+BiocParallel::register(BiocParallel::SerialParam())
+
+counts <- as.matrix(counts)
+sce <- fitGAM(counts = counts,
+                  sds = crv)
+# This takes about 1mn to run
+```
+  
+- Can also plot the cells in reduced dimension to see where the knots are located.  
+```{r}
+plotGeneCount(curve = crv, counts = counts, clusters = cl,
+              models = sce)
+```
+  
+  
+# Within-lineage comparisons  
+## Association of gene expression with pseudotime  
+- checking whether gene expression is associated with a particular lineage
+- testing the null hypothesis that all smoother coefficients are equal to each other
+- testing whether the smoothed gene expression is significantly changing along pseudotime
+  
+```{r}
+assoRes <- associationTest(sce)
+head(assoRes)
+```
+  
+## Discovering progenitor marker genes
+- assessing differential expression between the progenitor cell population (i.e., the starting point of a lineage) with the differentiated cell type population (i.e., the end point of a lineage).  
+  
+```{r}
+startRes <- startVsEndTest(sce)
+
+# Visualize the estimated smoothers for the most significant gene.
+oStart <- order(startRes$waldStat, decreasing = TRUE)
+sigGeneStart <- names(sce)[oStart[1]]
+plotSmoothers(sce, counts, gene = sigGeneStart)
+```
+  
+```{r}
+# color the cells in UMAP space with that gene’s expression
+plotGeneCount(crv, counts, gene = sigGeneStart)
+```
+  
+## Comparing specific pseudotime values within a lineage  
+- The startVsEndTest compares two points on a lineage, and by default it is comparing the inception point with the end point.  
+  
+```{r}
+customRes <- startVsEndTest(sce, pseudotimeValues = c(0.1, 0.8))
+```
+  
+  
+# Between-lineage comparisons 
+## Discovering differentiated cell type markers  
+- tradeSeq can discover marker genes for the differentiated cell types by comparing the end points of the lineage-specific smoothers.
+- By default, diffEndTest performs an omnibus test, testing the null hypothesis that the endpoint expression is equal for all lineages using a multivariate Wald test.  
+  
+```{r}
+endRes <- diffEndTest(sce)
+
+# plot the most significant gene using the plotSmoothers function.
+o <- order(endRes$waldStat, decreasing = TRUE)
+sigGene <- names(sce)[o[1]]
+plotSmoothers(sce, counts, sigGene)
+```
+  
+```{r}
+# color the cells in UMAP space with that gene's expression
+plotGeneCount(crv, counts, gene = sigGene)
+```
+  
+## Discovering genes with different expression patterns (?)  
+- The function patternTest implements a statistical method that checks whether the smoothed gene expression is equal along pseudotime between two or multiple lineages.  
+  
+```{r}
+patternRes <- patternTest(sce)
+oPat <- order(patternRes$waldStat, decreasing = TRUE)
+head(rownames(patternRes)[oPat])
+```
+  
+```{r}
+plotSmoothers(sce, counts, gene = rownames(patternRes)[oPat][1])
+plotGeneCount(crv, counts, gene = rownames(patternRes)[oPat][1])
+```
+  
+- sort the genes according to the sum of square of their rank in increasing Wald statistics for the patternTest and their rank in decreasing Wald statistics for the diffEndTest.  
+  
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+  
+```{r}
+compare <- inner_join(patternRes %>% mutate(Gene = rownames(patternRes),
+                                            pattern = waldStat) %>%
+                                     select(Gene, pattern),
+                      endRes %>% mutate(Gene = rownames(endRes),
+                                        end = waldStat) %>%
+                                 select(Gene, end),
+                      by = c("Gene" = "Gene")) %>%
+           mutate(transientScore = (min_rank(desc(end)))^2 +
+                                   (dense_rank(pattern))^2)
+
+ggplot(compare, aes(x = log(pattern), y = log(end))) +
+  geom_point(aes(col = transientScore)) +
+  labs(x = "patternTest Wald Statistic (log scale)",
+       y = "diffEndTest Wald Statistic (log scale)") +
+  scale_color_continuous(low = "yellow", high = "red") +
+  theme_classic()
+```
+  
+```{r}
+# visualize the expression in UMAP space of the top gene.  
+
+topTransient <- (compare %>% arrange(desc(transientScore)))[1, "Gene"]
+plotSmoothers(sce, counts, gene = topTransient)
+
+plotGeneCount(crv, counts, gene = topTransient)
+```
+  
+## Early Drivers of differentiation  
+- find a list of genes that are differentially expressed around the separation of two or multiple lineages.  
+- The function earlyDETest implements a statistical method to tests the null hypothesis of whether the smoothers are equal between two user-specified knots by building on the patternTest, but restricting itself to a particular location of the smoothers.  
+  
+```{r}
+plotGeneCount(curve = crv, counts = counts, clusters = cl,
+              models = sce)
+```
+  
+```{r}
+earlyDERes <- earlyDETest(sce, knots = c(1, 2))
+oEarly <- order(earlyDERes$waldStat, decreasing = TRUE)
+head(rownames(earlyDERes)[oEarly])
+```
+  
+```{r}
+plotSmoothers(sce, counts, gene = rownames(earlyDERes)[oEarly][2])
+```
+  
+```{r}
+plotGeneCount(crv, counts, gene = rownames(earlyDERes)[oEarly][2])
+```
+  
+  
+# Clustering of genes according to their expression pattern  
+- tradeSeq provides the functionality to cluster genes according to their expression pattern along the lineages with the clusterExpressionPatterns function  
+  
+```{r}
+library(clusterExperiment)
+```
+  
+```{r}
+nPointsClus <- 20
+clusPat <- clusterExpressionPatterns(sce, nPoints = nPointsClus,
+                                     genes = rownames(counts)[1:200])
+
+clusterLabels <- primaryCluster(clusPat$rsec)
+```
+  
+```{r}
+library(cowplot)
+```
+  
+```{r}
+cUniq <- unique(clusterLabels)
+cUniq <- cUniq[!cUniq == -1] # remove unclustered genes
+
+plots <- list()
+for (xx in cUniq[1:4]) {
+  cId <- which(clusterLabels == xx)
+  p <- ggplot(data = data.frame(x = 1:nPointsClus,
+                                y = rep(range(clusPat$yhatScaled[cId, ]),
+                                        nPointsClus / 2)),
+              aes(x = x, y = y)) +
+    geom_point(alpha = 0) +
+    labs(title = paste0("Cluster ", xx),  x = "Pseudotime", y = "Normalized expression") +
+    theme_classic()
+  for (ii in 1:length(cId)) {
+    geneId <- rownames(clusPat$yhatScaled)[cId[ii]]
+    p <- p +
+      geom_line(data = data.frame(x = rep(1:nPointsClus, 2),
+                                  y = clusPat$yhatScaled[geneId, ],
+                                  lineage = rep(0:1, each = nPointsClus)),
+                aes(col = as.character(lineage), group = lineage), lwd = 1.5)
+  }
+  p <- p + guides(color = FALSE) +
+    scale_color_manual(values = c("orange", "darkseagreen3"),
+                       breaks = c("0", "1"))  
+  plots[[as.character(xx)]] <- p
+}
+plots$ncol <- 2
+do.call(plot_grid, plots)
+```
+
+

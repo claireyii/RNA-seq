@@ -1,0 +1,132 @@
+---
+title: "test2"
+author: "Claire Man"
+date: "4/7/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Data and Packages
+```{r results = 'hide', message = FALSE, warning = FALSE}
+load("../data/se_paul.rda")
+library(SingleCellExperiment)
+library(scater)
+library(slingshot)
+library(tradeSeq)
+library(mclust, quietly = TRUE)
+library(RColorBrewer)
+library(remotes)
+library(readr)
+library(stats)
+```
+  
+  
+## Upstream Analysis  
+```{r}
+# Change count matrix from a dgcmatrix back into a normal matrix. 
+counts(se) <- as.matrix(counts(se))
+
+# Add another assay called logcounts
+se <- logNormCounts(se)
+
+# Add PCA and UMAP results in reducedDim
+se <- scater::runPCA(se)
+se <- runUMAP(se)
+se <- runPCA(se, ncomponents = 15)
+# Compute reduced dim matrix
+rd <- reducedDim(se, "PCA")
+
+# Clustering
+cl <- kmeans(rd, 7)$cluster
+
+# Add kmeans to colData (names)
+se$kmeans <- cl
+
+# Plot based on UMAP by kmeans clustering
+plotReducedDim(se, dimred = "UMAP", colour_by = "kmeans")
+
+# Plot based on UMAP by cell type clustering
+plotReducedDim(se, dimred = "UMAP", colour_by = "cell_type2") 
+```
+  
+  
+## Slingshot  
+```{r}
+# Run slingshot, colData now has slingPseudotime_1 in it
+se <- slingshot(se, clusterLabels = "kmeans", reducedDim = "PCA", start.clus = 3)
+
+# Plot UMAP with fitting curve
+plot(reducedDims(se)$PCA, col = brewer.pal(9, "Set1")[se$kmeans], pch = 16, asp = 1)
+lines(SlingshotDataSet(se), lwd = 2, col = "black")
+```
+  
+  
+## Fit GAM
+
+```{r}
+# sce <- fitGAM(counts = se, genes = 1:20)
+# saveRDS(sce, file = "fitGAM_output.rds")
+GAM <- read_rds("../data/fitGAM_output.rds")
+```
+  
+```{r}
+predictions <- predictSmooth(GAM, gene = 1:20, nPoints = 40) 
+# Error in predictSmooth(sce, gene = 1:10, nPoints = 40) : could not find function "predictSmooth"
+```
+  
+  
+## Curves
+
+```{r}
+# Extract the curve objects
+sds <- SlingshotDataSet(se)
+```
+  
+**Principle Curve**: Fits a principal curve which describes a smooth curve that passes through the middle of the data x in an orthogonal sense. 
+Arguments: x - a mtrix of points in arbitrary dimension. 
+
+```{r}
+# fit <- principal_curve(counts(se))
+```
+  
+```{r}
+# Send it back to the count space
+head(sds@curves$curve1$s)
+
+# ?prcomp
+# Compute the first 15 principal components
+pca <- prcomp(t(logcounts(se)), rank. = 15, center = FALSE, scale = FALSE)
+# pca2 <- prcomp(t(logcounts(se)), center = FALSE, scale = FALSE)
+
+# eigenvalues
+pca$sdev^2
+
+# projection of the cells in the reduced dimension space
+dim(pca$x)
+
+# matrix where the columns are the eigenvectors
+dim(pca$rotation)
+
+```
+
+```{r}
+# replace pca$x by sds@curves$curve1$s to get the new count matrix
+low_to_high <- function(pca, replace_x) {
+  sv <- diag(pca$sdev[1:dim(pca$rotation)[2]])
+  return(pca$rotation %*% sv %*% t(replace_x))
+}
+
+new_count_matrix <- low_to_high(pca, sds@curves$curve1$s)
+dim(new_count_matrix)
+
+# sanity check
+check <- calculatePCA(new_count_matrix, ncomponents = 15)
+```
+
+
+
+
+
